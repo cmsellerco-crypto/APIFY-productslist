@@ -4,20 +4,13 @@ import { PlaywrightCrawler } from 'crawlee';
 await Actor.init();
 
 const input = (await Actor.getInput()) ?? {};
-
 const startUrls = input.startUrls ?? [];
 const maxItems = input.maxItems ?? 20;
 
 let saved = 0;
 
-// Extrai ID do produto da URL (/ip/123456789)
-function extractProductId(url) {
-    const match = url.match(/\/ip\/(\d+)/);
-    return match ? match[1] : null;
-}
-
 const crawler = new PlaywrightCrawler({
-    maxRequestsPerCrawl: maxItems * 3,
+    maxRequestsPerCrawl: maxItems * 2,
     maxConcurrency: 2,
 
     async requestHandler({ request, page, enqueueLinks, log }) {
@@ -27,82 +20,92 @@ const crawler = new PlaywrightCrawler({
         const url = request.url;
 
         // ================================
-        // 1️⃣ PÁGINA DE PRODUTO WALMART
+        // LISTAGEM (brand page)
         // ================================
-        if (url.includes('/ip/')) {
+        if (!url.includes('/ip/')) {
 
-            await page.waitForTimeout(2500);
+            await page.waitForTimeout(2000);
 
-            const reduxState = await page.evaluate(() => {
-                return window.__WML_REDUX_INITIAL_STATE__;
-            }).catch(() => null);
-
-            if (!reduxState?.product?.products) {
-                log.warning("⚠️ Redux state não encontrado.");
-                return;
+            for (let i = 0; i < 6; i++) {
+                await page.mouse.wheel(0, 3000);
+                await page.waitForTimeout(1500);
             }
 
-            try {
-                const products = reduxState.product.products;
-                const productKey = Object.keys(products)[0];
-                const product = products[productKey];
+            const links = await page.$$eval(
+                "a[href*='/ip/']",
+                els => els.map(e => e.href)
+            );
 
-                const priceInfo = product.priceInfo || {};
-                const currentPrice = priceInfo.currentPrice?.price ?? null;
-                const listPrice = priceInfo.wasPrice?.price ?? null;
+            const uniqueLinks = [...new Set(links)];
 
-                const output = {
-                    Retailer: "walmart",
-                    Brand: product.brand ?? null,
-                    ProductId: product.usItemId ?? extractProductId(url),
-                    ProductTitle: product.productName ?? null,
-                    ProductUrl: url,
-                    ImageUrl: product.imageInfo?.thumbnailUrl ?? null,
-                    VariantId: product.usItemId ?? extractProductId(url),
-                    SKU: product.model ? String(product.model) : null,
-                    UPC: product.upc ? String(product.upc) : null,
-                    Color: null,
-                    Size: null,
-                    Price: currentPrice,
-                    ListPrice: listPrice,
-                    Availability: product.availabilityStatus ?? null,
-                    Currency: "USD"
-                };
+            log.info(`🔎 ${uniqueLinks.length} links encontrados.`);
 
-                await Actor.pushData(output);
-                saved++;
-
-                log.info(`✅ Produto salvo (${saved}/${maxItems})`);
-            } catch (err) {
-                log.warning("❌ Erro ao extrair produto.");
-            }
+            await enqueueLinks({
+                urls: uniqueLinks.slice(0, maxItems)
+            });
 
             return;
         }
 
         // ================================
-        // 2️⃣ PÁGINA DE LISTAGEM (Brand)
+        // PRODUTO
         // ================================
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(2500);
 
-        // Scroll para carregar lazy load
-        for (let i = 0; i < 6; i++) {
-            await page.mouse.wheel(0, 3000);
-            await page.waitForTimeout(1500);
+        // Intercepta dados do script JSON embutido
+        const productJson = await page.evaluate(() => {
+            const scripts = Array.from(document.querySelectorAll("script"));
+            for (const s of scripts) {
+                if (s.textContent && s.textContent.includes('"__WML_REDUX_INITIAL_STATE__"')) {
+                    const match = s.textContent.match(/window\.__WML_REDUX_INITIAL_STATE__\s*=\s*({.*});/);
+                    if (match && match[1]) {
+                        try {
+                            return JSON.parse(match[1]);
+                        } catch {
+                            return null;
+                        }
+                    }
+                }
+            }
+            return null;
+        });
+
+        if (!productJson?.product?.products) {
+            log.warning("⚠️ Produto JSON não encontrado.");
+            return;
         }
 
-        const links = await page.$$eval(
-            "a[href*='/ip/']",
-            elements => elements.map(el => el.href)
-        );
+        try {
+            const products = productJson.product.products;
+            const key = Object.keys(products)[0];
+            const product = products[key];
 
-        const uniqueLinks = [...new Set(links)];
+            const output = {
+                Retailer: "walmart",
+                Brand: product.brand ?? null,
+                ProductId: product.usItemId ?? null,
+                ProductTitle: product.productName ?? null,
+                ProductUrl: url,
+                ImageUrl: product.imageInfo?.thumbnailUrl ?? null,
+                VariantId: product.usItemId ?? null,
+                SKU: product.model ? String(product.model) : null,
+                UPC: product.upc ? String(product.upc) : null,
+                Color: null,
+                Size: null,
+                Price: product.priceInfo?.currentPrice?.price ?? null,
+                ListPrice: product.priceInfo?.wasPrice?.price ?? null,
+                Availability: product.availabilityStatus ?? null,
+                Currency: "USD"
+            };
 
-        log.info(`🔎 ${uniqueLinks.length} links encontrados na listagem.`);
+            await Actor.pushData(output);
+            saved++;
 
-        await enqueueLinks({
-            urls: uniqueLinks.slice(0, maxItems)
-        });
+            log.info(`✅ Produto salvo (${saved}/${maxItems})`);
+
+        } catch (err) {
+            log.warning("❌ Erro ao processar produto.");
+        }
     }
 });
 
