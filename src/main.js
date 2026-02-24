@@ -1,324 +1,369 @@
 // src/main.js
-import { Actor, log } from 'apify';
-import { PlaywrightCrawler, Dataset } from 'crawlee';
+import { Actor } from 'apify';
+import {
+    PlaywrightCrawler,
+    log,
+    RequestQueue,
+    sleep,
+} from 'crawlee';
+
+function normalizeUrl(url, baseUrl) {
+    try {
+        return new URL(url, baseUrl).toString();
+    } catch {
+        return null;
+    }
+}
 
 function uniq(arr) {
-  return [...new Set((arr || []).filter(Boolean))];
+    return [...new Set(arr.filter(Boolean))];
 }
 
-function safeJsonParse(str) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
+async function autoScroll(page, steps = 8, stepDelayMs = 800) {
+    for (let i = 0; i < steps; i++) {
+        await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.9)));
+        await page.waitForTimeout(stepDelayMs);
+    }
+    // volta um pouquinho (às vezes ajuda a renderizar cards)
+    await page.evaluate(() => window.scrollBy(0, -Math.floor(window.innerHeight * 0.2)));
+    await page.waitForTimeout(400);
 }
 
-function getDomain(url) {
-  try {
-    return new URL(url).hostname.replace(/^www\./, '');
-  } catch {
-    return '';
-  }
-}
+function extractFromJsonLd(jsonLd) {
+    // aceita objeto ou array
+    const nodes = Array.isArray(jsonLd) ? jsonLd : [jsonLd];
+    const products = [];
 
-function absolutizeUrl(href, baseUrl) {
-  try {
-    return new URL(href, baseUrl).toString();
-  } catch {
-    return null;
-  }
-}
+    for (const node of nodes) {
+        if (!node) continue;
 
-// Tenta achar URLs de produto dentro do __NEXT_DATA__ (Next.js)
-function extractProductUrlsFromNextData(nextData, baseUrl) {
-  const out = [];
+        // graph
+        if (node['@graph'] && Array.isArray(node['@graph'])) {
+            for (const g of node['@graph']) products.push(...extractFromJsonLd(g));
+            continue;
+        }
 
-  const pushIfUrl = (u) => {
-    if (!u) return;
-    // alguns campos podem ser path "/ip/...."
-    const abs = absolutizeUrl(u, baseUrl);
-    if (abs) out.push(abs);
-  };
-
-  // Busca profunda por qualquer campo que pareça URL de produto
-  const visit = (node) => {
-    if (!node) return;
-
-    if (Array.isArray(node)) {
-      for (const v of node) visit(v);
-      return;
+        const type = node['@type'];
+        if (type === 'Product' || (Array.isArray(type) && type.includes('Product'))) {
+            products.push(node);
+        }
     }
 
-    if (typeof node === 'object') {
-      // Campos comuns vistos em páginas de busca/listagem
-      const candidates = [
-        node.canonicalUrl,
-        node.canonicalUrlPath,
-        node.productPageUrl,
-        node.productPageUrlPath,
-        node.url,
-        node.link,
-        node.seoUrl,
-      ];
-      for (const c of candidates) pushIfUrl(c);
+    return products;
+}
 
-      for (const k of Object.keys(node)) visit(node[k]);
-    }
-  };
+function pickOffer(offers) {
+    if (!offers) return null;
+    if (Array.isArray(offers)) return offers[0] || null;
+    return offers;
+}
 
-  // Caminhos frequentes do Walmart (podem mudar)
-  // props.pageProps.initialData.searchResult.itemStacks[0].items
-  const items =
-    nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks?.flatMap((s) => s?.items || []) ||
-    nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks?.[0]?.items ||
-    nextData?.props?.pageProps?.initialData?.searchResult?.searchResult?.itemStacks?.[0]?.items ||
-    null;
+function safeNumber(x) {
+    if (x === null || x === undefined) return null;
+    const n = Number(String(x).replace(/[^\d.]/g, ''));
+    return Number.isFinite(n) ? n : null;
+}
 
-  if (items) visit(items);
-  // fallback: varre o JSON inteiro
-  else visit(nextData);
+/**
+ * Walmart: tenta extrair links/ids da listagem via __NEXT_DATA__
+ */
+function walmartLinksFromNextData(nextData, baseUrl) {
+    const links = [];
 
-  // Filtra só URLs que parecem produto no Walmart (ip/)
-  const filtered = uniq(out).filter((u) => {
     try {
-      const p = new URL(u).pathname;
-      return p.includes('/ip/') || p.startsWith('/ip/');
+        // Estrutura pode variar bastante.
+        // Vamos percorrer recursivamente e procurar strings que parecem URLs de /ip/
+        const seen = new Set();
+
+        const walk = (obj) => {
+            if (!obj || typeof obj !== 'object') return;
+
+            if (typeof obj === 'string') {
+                if (obj.includes('/ip/')) {
+                    const url = normalizeUrl(obj.startsWith('http') ? obj : obj, baseUrl);
+                    if (url && !seen.has(url)) {
+                        seen.add(url);
+                        links.push(url);
+                    }
+                }
+                return;
+            }
+
+            if (Array.isArray(obj)) {
+                for (const it of obj) walk(it);
+                return;
+            }
+
+            for (const v of Object.values(obj)) {
+                if (typeof v === 'string') {
+                    if (v.includes('/ip/')) {
+                        const url = normalizeUrl(v.startsWith('http') ? v : v, baseUrl);
+                        if (url && !seen.has(url)) {
+                            seen.add(url);
+                            links.push(url);
+                        }
+                    }
+                } else {
+                    walk(v);
+                }
+            }
+        };
+
+        walk(nextData);
     } catch {
-      return false;
+        // ignore
     }
-  });
 
-  return filtered;
+    return links;
 }
 
-// Extrai JSON-LD do tipo Product
-function extractJsonLdProductsFromHtml(html) {
-  const products = [];
-  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const json = safeJsonParse(m[1].trim());
-    if (!json) continue;
+async function extractListingLinks(page, { productLinkSelector }) {
+    const baseUrl = page.url();
 
-    const candidates = Array.isArray(json) ? json : [json];
-    for (const c of candidates) {
-      // pode vir como { "@graph": [...] }
-      const graph = c?.['@graph'];
-      if (Array.isArray(graph)) {
-        for (const g of graph) products.push(g);
-      } else {
-        products.push(c);
-      }
+    // 1) Tenta __NEXT_DATA__ (Walmart frequentemente usa isso em search/cp/brand)
+    let nextLinks = [];
+    try {
+        const nextDataJson = await page.locator('script#__NEXT_DATA__').first().textContent({ timeout: 2000 });
+        if (nextDataJson) {
+            const nextData = JSON.parse(nextDataJson);
+            nextLinks = walmartLinksFromNextData(nextData, baseUrl);
+            if (nextLinks.length) {
+                log.info(`🧠 __NEXT_DATA__ detectado. Links encontrados: ${nextLinks.length}`);
+            }
+        }
+    } catch {
+        // sem NEXT_DATA ou parse falhou — segue
     }
-  }
 
-  // filtra Product
-  return products.filter((p) => {
-    const t = p?.['@type'];
-    if (Array.isArray(t)) return t.includes('Product');
-    return t === 'Product';
-  });
+    // 2) Scroll + DOM fallback
+    // (muita página só injeta os cards no DOM depois)
+    await autoScroll(page, 10, 800);
+
+    const domLinks = await page.$$eval('a[href]', (as) => as.map((a) => a.getAttribute('href')).filter(Boolean));
+    const filtered = domLinks
+        .map((href) => {
+            // aceita o selector custom e também /ip/ que é bem padrão do Walmart
+            const ok =
+                (productLinkSelector && href && href.includes(productLinkSelector.replace(/[\[\]]/g, ''))) ||
+                href.includes('/ip/');
+            if (!ok) return null;
+            return href;
+        })
+        .filter(Boolean);
+
+    const normalizedDom = uniq(filtered.map((u) => {
+        // Walmart tem links relativos
+        if (u.startsWith('//')) return `https:${u}`;
+        return normalizeUrl(u, baseUrl);
+    }));
+
+    // Junta tudo
+    const links = uniq([...nextLinks, ...normalizedDom]);
+
+    return links;
 }
 
-// Monta um registro padronizado para o Dataset (para CSV depois)
-function mapToRecord({ url, title, brand, sku, gtin, upc, price, currency, variantOf, itemId }) {
-  return {
-    url: url || null,
-    title: title || null,
-    brand: brand || null,
-    sku: sku || null,
-    gtin: gtin || null,
-    upc: upc || null,
-    price: price ?? null,
-    currency: currency || null,
-    variant_of: variantOf || null,
-    item_id: itemId || null,
-    scraped_at: new Date().toISOString(),
-  };
+async function extractProductData(page) {
+    const url = page.url();
+
+    // 1) JSON-LD Product
+    let jsonLdProducts = [];
+    try {
+        const jsonLdTexts = await page.$$eval('script[type="application/ld+json"]', (els) =>
+            els.map((e) => e.textContent).filter(Boolean)
+        );
+
+        for (const t of jsonLdTexts) {
+            try {
+                const parsed = JSON.parse(t);
+                jsonLdProducts.push(...extractFromJsonLd(parsed));
+            } catch {
+                // alguns scripts têm JSON inválido — ignora
+            }
+        }
+    } catch {
+        // ignore
+    }
+
+    if (jsonLdProducts.length) {
+        const p = jsonLdProducts[0];
+        const offer = pickOffer(p.offers);
+
+        const title = p.name ?? null;
+        const brand =
+            (typeof p.brand === 'string' ? p.brand : (p.brand?.name ?? null)) ?? null;
+
+        const sku = p.sku ?? p.mpn ?? null;
+        const gtin =
+            p.gtin13 ?? p.gtin12 ?? p.gtin14 ?? p.gtin8 ?? p.gtin ?? null;
+
+        const price = offer?.price ?? offer?.lowPrice ?? null;
+        const currency = offer?.priceCurrency ?? null;
+
+        return {
+            url,
+            title,
+            brand,
+            sku,
+            gtin,
+            price: price !== null ? safeNumber(price) : null,
+            currency,
+            source: 'json-ld',
+        };
+    }
+
+    // 2) Fallback simples (título do HTML)
+    const title = await page.title().catch(() => null);
+
+    return {
+        url,
+        title,
+        brand: null,
+        sku: null,
+        gtin: null,
+        price: null,
+        currency: null,
+        source: 'fallback',
+    };
 }
 
 await Actor.init();
 
-const input = await Actor.getInput() || {};
-
-const startUrls = Array.isArray(input.startUrls) ? input.startUrls : [];
+const input = await Actor.getInput() ?? {};
+const startUrls = (input.startUrls ?? []).map((u) => (typeof u === 'string' ? u : u?.url)).filter(Boolean);
 const maxItems = Number.isFinite(input.maxItems) ? input.maxItems : 200;
+const sameDomainOnly = input.sameDomainOnly !== false;
 const productLinkSelector =
-  input.productLinkSelector ||
-  'a[href*="/ip/"], a[href*="/ip/"], a[href*="/p/"], a[href*="/dp/"]';
-const sameDomainOnly = input.sameDomainOnly !== false; // default true
+    input.productLinkSelector ||
+    'a[href*="/ip/"], a[href*="/dp/"], a[href*="/p/"], a[href*="product"]';
 
 if (!startUrls.length) {
-  throw new Error('Input "startUrls" é obrigatório e deve ser um array.');
+    throw new Error('startUrls é obrigatório (adicione pelo menos 1 URL).');
 }
 
 log.info(`✅ Iniciando com ${startUrls.length} startUrls | maxItems=${maxItems} | sameDomainOnly=${sameDomainOnly}`);
 
-const dataset = await Dataset.open();
+const requestQueue = await Actor.openRequestQueue();
 
-let pushedCount = 0;
+// Enfileira as startUrls
+await requestQueue.addRequests(
+    startUrls.map((url) => ({ url, userData: { label: 'START' } }))
+);
+
+let savedCount = 0;
 
 const crawler = new PlaywrightCrawler({
-  maxConcurrency: 1, // mais seguro p/ evitar bloqueio e explosão de memória
-  // Você pode aumentar depois.
-  requestHandlerTimeoutSecs: 120,
+    requestQueue,
 
-  preNavigationHooks: [
-    async ({ page }) => {
-      // deixa mais “humano” e reduz detecção boba
-      await page.setExtraHTTPHeaders({
-        'accept-language': 'en-US,en;q=0.9',
-      });
+    // Concurrency baixa ajuda MUITO no Apify pra não estourar memória
+    maxConcurrency: 1,
+
+    // timeouts mais generosos (Walmart é pesado)
+    requestHandlerTimeoutSecs: 180,
+
+    // reduzir retries para evitar loop em páginas bloqueadas
+    maxRequestRetries: 2,
+
+    // configurações do Playwright
+    launchContext: {
+        launchOptions: {
+            headless: true,
+        },
     },
-  ],
 
-  async requestHandler({ request, page, enqueueLinks }) {
-    const { url } = request;
-    const domain = getDomain(url);
+    // bloqueia recursos pesados (memória!)
+    preNavigationHooks: [
+        async ({ page }) => {
+            await page.route('**/*', async (route) => {
+                const req = route.request();
+                const type = req.resourceType();
+                const url = req.url();
 
-    // Pega HTML uma vez
-    const html = await page.content();
+                // bloqueia imagens, fontes, mídia e trackers comuns
+                if (['image', 'media', 'font'].includes(type)) return route.abort();
 
-    // 1) tenta detectar __NEXT_DATA__
-    const nextDataText = await page
-      .$eval('script#__NEXT_DATA__', (el) => el.textContent)
-      .catch(() => null);
+                // alguns scripts de tracking pesam muito
+                if (
+                    url.includes('googletagmanager') ||
+                    url.includes('google-analytics') ||
+                    url.includes('doubleclick') ||
+                    url.includes('adsystem') ||
+                    url.includes('adservice')
+                ) return route.abort();
 
-    const nextData = nextDataText ? safeJsonParse(nextDataText) : null;
+                return route.continue();
+            });
 
-    // Heurística: se não parece página de produto, trate como listagem/busca
-    const path = (() => {
-      try { return new URL(url).pathname; } catch { return ''; }
-    })();
+            // dá um tempinho pra estabilizar
+            page.setDefaultTimeout(45000);
+        },
+    ],
 
-    const looksLikeProduct = path.includes('/ip/');
-    const looksLikeListing = !looksLikeProduct;
+    requestHandler: async ({ request, page }) => {
+        const url = request.url;
 
-    if (looksLikeListing) {
-      // A) Primeiro tenta puxar URLs de produto do __NEXT_DATA__ (Walmart/Next.js)
-      let productUrls = [];
-      if (nextData) {
-        productUrls = extractProductUrlsFromNextData(nextData, url);
-      }
-
-      // B) fallback: DOM selector
-      if (!productUrls.length) {
-        log.info(`📄 Listagem detectada. Tentando fallback por DOM selector...`);
-        await enqueueLinks({
-          selector: productLinkSelector,
-          limit: Math.max(0, maxItems - pushedCount),
-          transformRequestFunction: (req) => {
-            if (!req?.url) return null;
-            if (sameDomainOnly && getDomain(req.url) !== domain) return null;
-            return req;
-          },
-        });
-        log.info(`📥 Links enfileirados a partir de DOM em: ${url}`);
-        return;
-      }
-
-      // Enfileira as URLs do __NEXT_DATA__
-      productUrls = productUrls.slice(0, Math.max(0, maxItems - pushedCount));
-
-      for (const pUrl of productUrls) {
-        if (sameDomainOnly && getDomain(pUrl) !== domain) continue;
-        await request.queue.addRequest({ url: pUrl, userData: { label: 'PRODUCT' } });
-        pushedCount++;
-        if (pushedCount >= maxItems) break;
-      }
-
-      log.info(`📄 Listagem detectada. Produtos via __NEXT_DATA__: ${productUrls.length} | total enfileirado=${pushedCount}`);
-      return;
-    }
-
-    // Produto
-    // 2) Extrai do JSON-LD
-    const jsonLdProducts = extractJsonLdProductsFromHtml(html);
-
-    // Walmart às vezes tem múltiplos blocos; pega o “melhor”
-    const bestJsonLd = jsonLdProducts[0] || null;
-
-    // 3) tenta extrair campos também do __NEXT_DATA__ (quando JSON-LD não traz UPC/SKU etc)
-    let title = bestJsonLd?.name;
-    let brand = bestJsonLd?.brand?.name || bestJsonLd?.brand;
-    let sku = bestJsonLd?.sku;
-    let gtin = bestJsonLd?.gtin || bestJsonLd?.gtin13 || bestJsonLd?.gtin12;
-    let upc = bestJsonLd?.gtin12 || null;
-
-    let price = null;
-    let currency = null;
-
-    const offer = Array.isArray(bestJsonLd?.offers) ? bestJsonLd?.offers?.[0] : bestJsonLd?.offers;
-    if (offer) {
-      price = offer.price ?? null;
-      currency = offer.priceCurrency ?? null;
-    }
-
-    // Puxa mais dados do nextData (tolerante)
-    let itemId = null;
-    let variantOf = null;
-
-    if (nextData) {
-      // alguns caminhos frequentes do Walmart
-      const raw =
-        nextData?.props?.pageProps?.initialData?.data ||
-        nextData?.props?.pageProps?.initialData ||
-        nextData?.props?.pageProps ||
-        null;
-
-      const tryVisit = (node) => {
-        if (!node) return;
-        if (Array.isArray(node)) return node.forEach(tryVisit);
-        if (typeof node !== 'object') return;
-
-        // heurísticas para capturar campos comuns
-        if (!title && typeof node.name === 'string') title = node.name;
-        if (!brand && (typeof node.brand === 'string' || typeof node.brand?.name === 'string')) {
-          brand = node.brand?.name || node.brand;
-        }
-        if (!sku && typeof node.sku === 'string') sku = node.sku;
-        if (!gtin && typeof node.gtin === 'string') gtin = node.gtin;
-        if (!upc && typeof node.upc === 'string') upc = node.upc;
-
-        if (!itemId && (typeof node.itemId === 'string' || typeof node.itemId === 'number')) {
-          itemId = String(node.itemId);
+        // respeita maxItems
+        if (savedCount >= maxItems) {
+            log.info(`🛑 maxItems atingido (${savedCount}). Parando de salvar/enfileirar.`);
+            return;
         }
 
-        // preço pode vir como { price: { price: 12.34, currencyUnit: "USD" } } etc
-        if (price == null && typeof node.price === 'number') price = node.price;
-        if (!currency && typeof node.currency === 'string') currency = node.currency;
-        if (!currency && typeof node.currencyUnit === 'string') currency = node.currencyUnit;
+        // Heurística: página de produto vs listagem
+        const isLikelyProduct =
+            url.includes('/ip/') ||
+            url.includes('/dp/') ||
+            url.includes('/p/') ||
+            request.userData?.label === 'DETAIL';
 
-        // “variantOf” pode aparecer de várias formas
-        if (!variantOf && typeof node.variantOf === 'string') variantOf = node.variantOf;
+        if (isLikelyProduct) {
+            const data = await extractProductData(page);
 
-        for (const k of Object.keys(node)) tryVisit(node[k]);
-      };
+            // salva no dataset
+            if (savedCount < maxItems) {
+                await Actor.pushData(data);
+                savedCount++;
+                log.info(`✅ Produto salvo (${savedCount}/${maxItems}): ${data.title ?? '(sem título)'}`);
+            }
+            return;
+        }
 
-      tryVisit(raw);
-    }
+        // LISTAGEM / START
+        log.info(`📄 Listagem detectada. Extraindo links... (${url})`);
 
-    const record = mapToRecord({
-      url,
-      title,
-      brand,
-      sku,
-      gtin,
-      upc,
-      price,
-      currency,
-      variantOf,
-      itemId,
-    });
+        const links = await extractListingLinks(page, { productLinkSelector });
 
-    await dataset.pushData(record);
+        log.info(`🔗 Links candidatos encontrados: ${links.length}`);
 
-    log.info(`✅ Produto salvo: ${record.title || '(sem título)'} | sku=${record.sku || '-'} | gtin/upc=${record.gtin || record.upc || '-'}`);
-  },
+        // filtra por domínio (opcional)
+        let finalLinks = links;
+        if (sameDomainOnly) {
+            const base = new URL(url);
+            finalLinks = links.filter((u) => {
+                try {
+                    return new URL(u).hostname === base.hostname;
+                } catch {
+                    return false;
+                }
+            });
+        }
+
+        // limita quantidade para não enfileirar “o universo”
+        const remaining = Math.max(0, maxItems - savedCount);
+        const toEnqueue = finalLinks.slice(0, Math.max(remaining * 3, 50)); // enfileira mais do que remaining para compensar páginas sem JSON-LD
+
+        log.info(`📥 Enfileirando ${toEnqueue.length} links de produto...`);
+
+        await requestQueue.addRequests(
+            toEnqueue.map((u) => ({ url: u, userData: { label: 'DETAIL' } }))
+        );
+
+        // evita bater muito rápido
+        await sleep(500);
+    },
 });
 
-await crawler.run(startUrls.map((u) => ({ url: u.url || u, userData: { label: 'START' } })));
+await crawler.run();
 
-log.info(`✅ Finalizado. Itens salvos no Dataset (exporte como CSV no Apify).`);
+log.info(`🏁 Finalizado. Itens salvos no Dataset: ${savedCount}. Exporte como CSV no Apify.`);
+
 await Actor.exit();
