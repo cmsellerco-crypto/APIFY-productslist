@@ -5,7 +5,8 @@
   "description": "Generic products scraper for Apify that extracts Product JSON-LD when available and crawls listing pages.",
   "dependencies": {
     "apify": "^3.0.0",
-    "crawlee": "^3.9.0"
+    "crawlee": "^3.9.0",
+    "playwright": "^1.41.2"
   },
   "scripts": {
     "start": "node src/main.js"
