@@ -7,9 +7,18 @@ const input = (await Actor.getInput()) ?? {};
 
 const startUrls = input.startUrls ?? [];
 const maxItems = Number.isFinite(input.maxItems) ? input.maxItems : 200;
+
+// Para Walmart, recomendo: "a[href*='/ip/'], a[href*='/sp/']"
 const productLinkSelector =
-  input.productLinkSelector ?? "a[href*='product'], a[href*='/p/'], a[href*='/dp/'], a[href*='/ip/']";
+  input.productLinkSelector ??
+  "a[href*='product'], a[href*='/p/'], a[href*='/dp/'], a[href*='/ip/'], a[href*='/sp/']";
+
 const sameDomainOnly = input.sameDomainOnly ?? true;
+
+// Quantidade de scrolls para páginas de listagem (Walmart geralmente precisa)
+const scrollRounds = Number.isFinite(input.scrollRounds) ? input.scrollRounds : 8;
+const scrollPixels = Number.isFinite(input.scrollPixels) ? input.scrollPixels : 2200;
+const scrollWaitMs = Number.isFinite(input.scrollWaitMs) ? input.scrollWaitMs : 1400;
 
 let saved = 0;
 
@@ -42,6 +51,33 @@ function normalizeGtin(product) {
   );
 }
 
+async function extractJsonLdProduct(page) {
+  const jsonLdRaw = await page.$$eval(
+    'script[type="application/ld+json"]',
+    (els) => els.map((e) => e.textContent).filter(Boolean)
+  );
+
+  const jsonLdBlocks = [];
+  for (const txt of jsonLdRaw) {
+    try {
+      jsonLdBlocks.push(JSON.parse(txt));
+    } catch {
+      // ignora JSON inválido
+    }
+  }
+  return pickJsonLdProduct(jsonLdBlocks);
+}
+
+async function doListingScroll(page) {
+  // Pequena espera para a página renderizar componentes JS
+  await page.waitForTimeout(2000);
+
+  for (let i = 0; i < scrollRounds; i++) {
+    await page.mouse.wheel(0, scrollPixels);
+    await page.waitForTimeout(scrollWaitMs);
+  }
+}
+
 const crawler = new PlaywrightCrawler({
   maxRequestsPerCrawl: 20000,
 
@@ -53,22 +89,8 @@ const crawler = new PlaywrightCrawler({
       return;
     }
 
-    // 1) Tenta extrair JSON-LD Product
-    const jsonLdRaw = await page.$$eval(
-      'script[type="application/ld+json"]',
-      (els) => els.map((e) => e.textContent).filter(Boolean)
-    );
-
-    const jsonLdBlocks = [];
-    for (const txt of jsonLdRaw) {
-      try {
-        jsonLdBlocks.push(JSON.parse(txt));
-      } catch {
-        // ignora JSON inválido
-      }
-    }
-
-    const product = pickJsonLdProduct(jsonLdBlocks);
+    // 1) Primeiro tenta extrair produto via JSON-LD (se for página de produto)
+    const product = await extractJsonLdProduct(page);
 
     if (product) {
       const offers = Array.isArray(product.offers) ? product.offers[0] : product.offers;
@@ -90,13 +112,20 @@ const crawler = new PlaywrightCrawler({
       return;
     }
 
-    // 2) Se não achou JSON-LD de produto, trata como listagem/busca e enfileira links
+    // 2) Se não é produto, trata como listagem/busca (ex.: Walmart brand page)
+    await doListingScroll(page);
+
+    // Log de diagnóstico: quantos links existem no DOM agora?
+    const linkCount = await page.$$eval(productLinkSelector, (els) => els.length).catch(() => 0);
+    log.info(`📄 Listagem detectada. Links de produto encontrados no DOM: ${linkCount}`);
+
+    // Enfileira links de produto
     await enqueueLinks({
       selector: productLinkSelector,
       strategy: sameDomainOnly ? 'same-domain' : 'all'
     });
 
-    log.info(`📄 Página de listagem/busca processada (links enfileirados): ${request.url}`);
+    log.info(`📥 Links enfileirados a partir de: ${request.url}`);
   }
 });
 
