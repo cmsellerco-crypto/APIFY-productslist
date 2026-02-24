@@ -1,0 +1,13 @@
+{
+  "name": "products-scraper",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Generic products scraper for Apify that extracts Product JSON-LD when available and crawls listing pages.",
+  "dependencies": {
+    "apify": "^3.0.0",
+    "crawlee": "^3.9.0"
+  },
+  "scripts": {
+    "start": "node src/main.js"
+  }
+}
