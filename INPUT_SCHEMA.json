@@ -18,13 +18,13 @@
       "description": "Limite máximo de produtos para salvar no dataset.",
       "default": 200
     },
-  "productLinkSelector": {
-  "title": "Product link selector (para páginas de lista)",
-  "type": "string",
-  "editor": "textfield",
-  "description": "CSS selector dos links de produto em páginas de listagem/busca.",
-  "default": "a[href*='product'], a[href*='/p/'], a[href*='/dp/']"
-}
+    "productLinkSelector": {
+      "title": "Product link selector (para páginas de lista)",
+      "type": "string",
+      "editor": "textfield",
+      "description": "CSS selector dos links de produto em páginas de listagem/busca.",
+      "default": "a[href*='product'], a[href*='/p/'], a[href*='/dp/']"
+    },
     "sameDomainOnly": {
       "title": "Same domain only",
       "type": "boolean",
