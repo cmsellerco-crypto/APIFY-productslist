@@ -1,0 +1,35 @@
+{
+  "title": "Products Scraper Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrls": {
+      "title": "Start URLs",
+      "type": "array",
+      "editor": "requestListSources",
+      "description": "URLs para começar (páginas de produto ou páginas de listagem/busca).",
+      "prefill": [
+        { "url": "https://example.com" }
+      ]
+    },
+    "maxItems": {
+      "title": "Max items",
+      "type": "integer",
+      "description": "Limite máximo de produtos para salvar no dataset.",
+      "default": 200
+    },
+    "productLinkSelector": {
+      "title": "Product link selector (para páginas de lista)",
+      "type": "string",
+      "description": "CSS selector dos links de produto em páginas de listagem/busca.",
+      "default": "a[href*='product'], a[href*='/p/'], a[href*='/dp/']"
+    },
+    "sameDomainOnly": {
+      "title": "Same domain only",
+      "type": "boolean",
+      "description": "Se true, só segue links no mesmo domínio.",
+      "default": true
+    }
+  },
+  "required": ["startUrls"]
+}
