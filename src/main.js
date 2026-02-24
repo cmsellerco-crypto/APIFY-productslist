@@ -8,7 +8,7 @@ const input = (await Actor.getInput()) ?? {};
 const startUrls = input.startUrls ?? [];
 const maxItems = Number.isFinite(input.maxItems) ? input.maxItems : 200;
 const productLinkSelector =
-  input.productLinkSelector ?? "a[href*='product'], a[href*='/p/'], a[href*='/dp/']";
+  input.productLinkSelector ?? "a[href*='product'], a[href*='/p/'], a[href*='/dp/'], a[href*='/ip/']";
 const sameDomainOnly = input.sameDomainOnly ?? true;
 
 let saved = 0;
@@ -45,10 +45,15 @@ function normalizeGtin(product) {
 const crawler = new PlaywrightCrawler({
   maxRequestsPerCrawl: 20000,
 
-  async requestHandler({ request, page, log }) {
-    if (saved >= maxItems) return;
+  async requestHandler(context) {
+    const { request, page, log, enqueueLinks } = context;
 
-    // Tenta extrair JSON-LD (muitas lojas expõem Product aqui)
+    if (saved >= maxItems) {
+      log.info(`✅ Atingiu maxItems (${maxItems}). Parando de salvar itens.`);
+      return;
+    }
+
+    // 1) Tenta extrair JSON-LD Product
     const jsonLdRaw = await page.$$eval(
       'script[type="application/ld+json"]',
       (els) => els.map((e) => e.textContent).filter(Boolean)
@@ -85,14 +90,13 @@ const crawler = new PlaywrightCrawler({
       return;
     }
 
-    // Se não achou JSON-LD de produto, trata como página de lista/busca e segue links.
+    // 2) Se não achou JSON-LD de produto, trata como listagem/busca e enfileira links
     await enqueueLinks({
-      page,
       selector: productLinkSelector,
       strategy: sameDomainOnly ? 'same-domain' : 'all'
     });
 
-    log.info(`📄 Página de lista/busca: links enfileirados. URL: ${request.url}`);
+    log.info(`📄 Página de listagem/busca processada (links enfileirados): ${request.url}`);
   }
 });
 
