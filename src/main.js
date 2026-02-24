@@ -1,5 +1,5 @@
 import { Actor } from 'apify';
-import { PlaywrightCrawler, enqueueLinks } from 'crawlee';
+import { PlaywrightCrawler } from 'crawlee';
 
 await Actor.init();
 
@@ -89,8 +89,7 @@ const crawler = new PlaywrightCrawler({
     await enqueueLinks({
       page,
       selector: productLinkSelector,
-      strategy: sameDomainOnly ? 'same-domain' : 'all',
-      requestQueue: crawler.requestQueue
+      strategy: sameDomainOnly ? 'same-domain' : 'all'
     });
 
     log.info(`📄 Página de lista/busca: links enfileirados. URL: ${request.url}`);
